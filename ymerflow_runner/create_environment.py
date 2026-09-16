@@ -111,6 +111,26 @@ class create_environment:
         if not registry_url:
             raise ValueError("REGISTRY_URL environment variable not set")
 
+        # ─── kaniko / go-containerregistry is broken by design; work around its idiocy ────────────
+        # REGISTRY_URL carries the explicit HTTPS port, e.g. "registry.ymerflow.earth:443". kaniko
+        # opens the push against that host:port, but our registry (behind nginx) hands back the
+        # blob-upload Location on the BARE host "registry.ymerflow.earth" — 443 is the scheme default
+        # so it's omitted, as every sane HTTP tool does. Go's stdlib http client — and therefore
+        # go-containerregistry, which kaniko pushes with — decides that "registry.ymerflow.earth:443"
+        # and "registry.ymerflow.earth" are DIFFERENT HOSTS, and helpfully strips the Authorization
+        # header on the "cross-host" redirect. So the blob-upload PATCH goes out ANONYMOUS and the
+        # registry rightly answers 401 UNAUTHORIZED — with credentials that are completely valid.
+        # crane, containerd, and a plain `docker push` all follow the very same redirect without
+        # losing auth; only kaniko/go manages to shoot itself in the foot here. Verified against the
+        # real prod registry: identical creds, :443 host → 401 on the PATCH; bare host end-to-end →
+        # clean push. The cure for a self-inflicted "the port changed so it's a new host" wound is to
+        # never let the port change: address the registry by the bare host (drop a redundant,
+        # scheme-default :443) for everything kaniko and crane touch, so the flow never mutates
+        # "host" mid-upload. The stored ref below keeps the :443 form on purpose — pods pull it via
+        # containerd (which is not broken and tolerates the redirect) and the imagePullSecret is
+        # keyed to that host:port. Same registry, same repo/tag, just addressed without the dead port.
+        push_registry_url = registry_url[:-len(':443')] if registry_url.endswith(':443') else registry_url
+
         # Slugify environment name
         env_slug = re.sub(r'[^a-z0-9-]', '-', environment_name.lower()).strip('-')
         if not env_slug:
@@ -119,7 +139,9 @@ class create_environment:
         # Build image tag: {registry_url}/proj-{project_id}/env-{slug}:{process_id}-{version}
         image_repository = f"{registry_url}/proj-{project_id}/env-{env_slug}"
         image_tag = f"{process_id}-{version}"
-        full_image_name = f"{image_repository}:{image_tag}"
+        full_image_name = f"{image_repository}:{image_tag}"  # stored/returned ref — pods pull this
+        # What kaniko pushes to and crane pulls from: bare host, per the broken-by-design note above.
+        push_image_name = f"{push_registry_url}/proj-{project_id}/env-{env_slug}:{image_tag}"
 
         print(f"Building image: {full_image_name}")
 
@@ -169,37 +191,43 @@ class create_environment:
                 '/kaniko-executor',
                 f'--context=dir://{tmpdir}',
                 f'--dockerfile={dockerfile_path}',
-                f'--destination={full_image_name}',
+                f'--destination={push_image_name}',  # bare host — see broken-by-design note above
                 '--insecure',  # For dev registry without TLS
                 '--skip-tls-verify',  # For dev registry
                 '--insecure-pull',  # Allow pulling from insecure registries
-                f'--skip-tls-verify-registry={registry_url}',  # Skip TLS for pulling from our registry
+                f'--skip-tls-verify-registry={push_registry_url}',  # Skip TLS for pulling from our registry
             ]
 
             # Add auth if provided
             if registry_auth:
+                # Keyed by the bare push host: kaniko resolves the credential by the host it pushes
+                # to, so the auths key must match push_registry_url (see broken-by-design note above).
                 config_content = {
                     "auths": {
-                        registry_url: {
+                        push_registry_url: {
                             "auth": registry_auth
                         }
                     }
                 }
 
-                # Setting KANIKO_DIR makes kaniko reset DOCKER_CONFIG to <KANIKO_DIR>/.docker at
-                # startup, ignoring whatever DOCKER_CONFIG we export (kaniko issue #3141). So write
-                # the auth into /kaniko/.docker: kaniko's relocation copies /kaniko to
-                # /kaniko-parent, landing the config at /kaniko-parent/.docker — exactly where kaniko
-                # then looks. crane (run afterwards to extract the schemas) does NOT relocate and
-                # reads DOCKER_CONFIG straight from our env, so point that at /kaniko/.docker too.
-                docker_config_dir = '/kaniko/.docker'
-                os.makedirs(docker_config_dir, exist_ok=True)
+                # The same config in two places, because kaniko and crane read it from different
+                # locations:
+                #  - kaniko: setting KANIKO_DIR makes kaniko RESET DOCKER_CONFIG to
+                #    <KANIKO_DIR>/.docker at startup, ignoring whatever we export (kaniko issue
+                #    #3141), and it relocates by copying /kaniko -> /kaniko-parent and then DELETING
+                #    /kaniko. So the auth has to sit in /kaniko/.docker to ride that copy into
+                #    /kaniko-parent/.docker — exactly where kaniko then looks.
+                #  - crane (run afterwards, in THIS process, to extract the schemas): /kaniko is gone
+                #    by then, so a DOCKER_CONFIG pointing there would be empty. Give crane its own
+                #    stable copy under tmpdir and point DOCKER_CONFIG at that.
+                kaniko_config_dir = '/kaniko/.docker'
+                crane_config_dir = os.path.join(tmpdir, '.docker')
+                for d in (kaniko_config_dir, crane_config_dir):
+                    os.makedirs(d, exist_ok=True)
+                    with open(os.path.join(d, 'config.json'), 'w') as f:
+                        json.dump(config_content, f)
 
-                config_path = os.path.join(docker_config_dir, 'config.json')
-                with open(config_path, 'w') as f:
-                    json.dump(config_content, f)
-
-                os.environ['DOCKER_CONFIG'] = docker_config_dir
+                os.environ['DOCKER_CONFIG'] = crane_config_dir
 
             print(f"Running Kaniko to build and push image...")
 
@@ -218,15 +246,16 @@ class create_environment:
 
             print(f"✓ Image built and pushed successfully: {full_image_name}")
 
-            # Extract process_schemas.json from the built image using crane. crane reads
-            # registry auth from DOCKER_CONFIG (set above to /kaniko/.docker); that path lives
-            # outside tmpdir, so this no longer has to run before the `with` block exits, but
-            # keeping it here is harmless.
+            # Extract process_schemas.json from the built image using crane. crane reads registry
+            # auth from DOCKER_CONFIG (set above to tmpdir/.docker), so this must run before the
+            # `with` block removes tmpdir. Pull from the bare push host, not full_image_name: crane
+            # is not go/kaniko-broken, but it still starts from the host you hand it, and using the
+            # :443 form would drag it through the same port-only "host change" on the blob GETs.
             print(f"Extracting process schemas from image...")
 
             tar_path = os.path.join(tmpdir, 'image.tar')
             crane_result = subprocess.run(
-                ['crane', 'export', '--insecure', full_image_name, tar_path],
+                ['crane', 'export', '--insecure', push_image_name, tar_path],
                 capture_output=True,
                 text=True,
                 timeout=60
