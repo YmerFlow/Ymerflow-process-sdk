@@ -203,27 +203,20 @@ class create_environment:
 
             print(f"Running Kaniko to build and push image...")
 
-            try:
-                result = subprocess.run(
-                    kaniko_args,
-                    cwd=tmpdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=600  # 10 minute timeout
-                )
+            # No inner timeout: the only bound on a build is the process's own deadline, enforced at
+            # the Job level (activeDeadlineSeconds — see job_orchestrator.create_job_manifest). A
+            # hardcoded subprocess timeout here just second-guessed that deadline, capping every
+            # environment build at 10 minutes regardless of what the user requested — so a big env
+            # (compiling e.g. simpeg/pyinterp on a small CPU quota) failed even when the process
+            # timeout was generous. Likewise no capture_output: let kaniko stream straight to the
+            # pod's stdout so build progress is visible live in the log stream instead of being
+            # swallowed and only surfaced (or lost, on timeout) at the end.
+            result = subprocess.run(kaniko_args, cwd=tmpdir)
 
-                print("Kaniko stdout:")
-                print(result.stdout)
+            if result.returncode != 0:
+                raise RuntimeError(f"Kaniko build failed with exit code {result.returncode}")
 
-                if result.returncode != 0:
-                    print("Kaniko stderr:")
-                    print(result.stderr)
-                    raise RuntimeError(f"Kaniko build failed with exit code {result.returncode}")
-
-                print(f"✓ Image built and pushed successfully: {full_image_name}")
-
-            except subprocess.TimeoutExpired:
-                raise RuntimeError("Kaniko build timed out after 10 minutes")
+            print(f"✓ Image built and pushed successfully: {full_image_name}")
 
             # Extract process_schemas.json from the built image using crane. crane reads
             # registry auth from DOCKER_CONFIG (set above to /kaniko/.docker); that path lives
