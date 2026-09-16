@@ -14,6 +14,7 @@ params.
 import json
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -187,6 +188,19 @@ class create_environment:
             os.makedirs('/kaniko', exist_ok=True)
             os.environ['KANIKO_DIR'] = '/kaniko-parent'
 
+            # kaniko builds by unpacking the target image's rootfs onto THIS container's / (that is
+            # how it runs the RUN steps), so when it's done the container filesystem is the freshly
+            # built image, not the runner's — anything not on kaniko's ignore-list is gone. That
+            # includes our tmpdir AND the crane binary we need immediately afterwards to pull the
+            # schemas back out of the pushed image; without protection crane vanishes and its output
+            # dir vanishes, and the schema step dies with "crane: not found" / "no such file or
+            # directory". So stage the crane binary and a dedicated extraction workspace onto
+            # kaniko's --ignore-path — the very list that keeps /kaniko-executor alive across a build
+            # — so they survive into the post-build step. (tmpdir is only the build context; it is
+            # consumed before the wipe and needs no protection.)
+            crane_bin = shutil.which('crane') or '/usr/local/bin/crane'
+            extract_dir = tempfile.mkdtemp()  # survives kaniko via --ignore-path; removed at end
+
             kaniko_args = [
                 '/kaniko-executor',
                 f'--context=dir://{tmpdir}',
@@ -196,6 +210,8 @@ class create_environment:
                 '--skip-tls-verify',  # For dev registry
                 '--insecure-pull',  # Allow pulling from insecure registries
                 f'--skip-tls-verify-registry={push_registry_url}',  # Skip TLS for pulling from our registry
+                f'--ignore-path={crane_bin}',    # keep crane alive through the rootfs wipe (see above)
+                f'--ignore-path={extract_dir}',  # keep the schema-extraction workspace alive too
             ]
 
             # Add auth if provided
@@ -211,17 +227,17 @@ class create_environment:
                 }
 
                 # The same config in two places, because kaniko and crane read it from different
-                # locations:
+                # locations AND kaniko wipes the filesystem between them:
                 #  - kaniko: setting KANIKO_DIR makes kaniko RESET DOCKER_CONFIG to
                 #    <KANIKO_DIR>/.docker at startup, ignoring whatever we export (kaniko issue
                 #    #3141), and it relocates by copying /kaniko -> /kaniko-parent and then DELETING
                 #    /kaniko. So the auth has to sit in /kaniko/.docker to ride that copy into
                 #    /kaniko-parent/.docker — exactly where kaniko then looks.
-                #  - crane (run afterwards, in THIS process, to extract the schemas): /kaniko is gone
-                #    by then, so a DOCKER_CONFIG pointing there would be empty. Give crane its own
-                #    stable copy under tmpdir and point DOCKER_CONFIG at that.
+                #  - crane (run afterwards to extract the schemas): by then kaniko has replaced the
+                #    rootfs, so anything under a non-ignored path is gone. Put crane's copy inside the
+                #    --ignore-path'd extract_dir so it survives, and point DOCKER_CONFIG there.
                 kaniko_config_dir = '/kaniko/.docker'
-                crane_config_dir = os.path.join(tmpdir, '.docker')
+                crane_config_dir = os.path.join(extract_dir, '.docker')
                 for d in (kaniko_config_dir, crane_config_dir):
                     os.makedirs(d, exist_ok=True)
                     with open(os.path.join(d, 'config.json'), 'w') as f:
@@ -246,19 +262,20 @@ class create_environment:
 
             print(f"✓ Image built and pushed successfully: {full_image_name}")
 
-            # Extract process_schemas.json from the built image using crane. crane reads registry
-            # auth from DOCKER_CONFIG (set above to tmpdir/.docker), so this must run before the
-            # `with` block removes tmpdir. Pull from the bare push host, not full_image_name: crane
-            # is not go/kaniko-broken, but it still starts from the host you hand it, and using the
-            # :443 form would drag it through the same port-only "host change" on the blob GETs.
+            # Extract process_schemas.json from the built image using crane. Everything here lives
+            # in extract_dir / crane_bin, which we --ignore-path'd above so it outlived kaniko's
+            # rootfs wipe. crane reads registry auth from DOCKER_CONFIG (pointed at
+            # extract_dir/.docker above). Pull from the bare push host, not full_image_name: crane is
+            # not go/kaniko-broken, but it still starts from the host you hand it, and the :443 form
+            # would drag it through the same port-only "host change" on the blob GETs. No timeout:
+            # exporting a multi-GB image can take minutes, and the process deadline already bounds it.
             print(f"Extracting process schemas from image...")
 
-            tar_path = os.path.join(tmpdir, 'image.tar')
+            tar_path = os.path.join(extract_dir, 'image.tar')
             crane_result = subprocess.run(
-                ['crane', 'export', '--insecure', push_image_name, tar_path],
+                [crane_bin, 'export', '--insecure', push_image_name, tar_path],
                 capture_output=True,
                 text=True,
-                timeout=60
             )
 
             if crane_result.returncode != 0:
@@ -276,6 +293,10 @@ class create_environment:
                     )
                 with tar.extractfile(member) as f:
                     process_schemas = json.loads(f.read().decode('utf-8'))
+
+            # extract_dir is a bare mkdtemp (outside the `with tmpdir`), so clean it up ourselves —
+            # this also frees the multi-GB image.tar before the storage write below.
+            shutil.rmtree(extract_dir, ignore_errors=True)
 
             print(f"✓ Extracted process schemas: {list(process_schemas.keys())}")
 
