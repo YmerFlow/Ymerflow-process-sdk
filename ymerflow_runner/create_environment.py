@@ -152,7 +152,19 @@ class create_environment:
             with open(dockerfile_path, 'w') as f:
                 f.write(dockerfile_content)
 
-            # Prepare kaniko auth config if needed
+            # Kaniko reserves its working directory (default /kaniko) and excludes it from every
+            # build stage's filesystem. Environments built with install_kaniko contain
+            # `COPY --from=kaniko /kaniko/executor /kaniko-executor` — a source *under* /kaniko —
+            # which the reservation makes invisible, so the build dies with
+            # "lstat /kaniko/0/kaniko/executor: no such file or directory". (The identical
+            # Dockerfile builds fine under Docker/BuildKit, which is why the host base-runner build
+            # succeeds but this in-pod kaniko build does not.) Relocating kaniko's working dir to
+            # /kaniko-parent leaves /kaniko an ordinary path the COPY can read. Kaniko relocates by
+            # copying the existing /kaniko dir to KANIKO_DIR at startup, so /kaniko must exist first
+            # (the base-runner bakes only the standalone /kaniko-executor binary, no /kaniko dir).
+            os.makedirs('/kaniko', exist_ok=True)
+            os.environ['KANIKO_DIR'] = '/kaniko-parent'
+
             kaniko_args = [
                 '/kaniko-executor',
                 f'--context=dir://{tmpdir}',
@@ -166,10 +178,6 @@ class create_environment:
 
             # Add auth if provided
             if registry_auth:
-                # Create Docker config.json from auth
-                docker_config_dir = os.path.join(tmpdir, '.docker')
-                os.makedirs(docker_config_dir, exist_ok=True)
-
                 config_content = {
                     "auths": {
                         registry_url: {
@@ -178,12 +186,19 @@ class create_environment:
                     }
                 }
 
+                # Setting KANIKO_DIR makes kaniko reset DOCKER_CONFIG to <KANIKO_DIR>/.docker at
+                # startup, ignoring whatever DOCKER_CONFIG we export (kaniko issue #3141). So write
+                # the auth into /kaniko/.docker: kaniko's relocation copies /kaniko to
+                # /kaniko-parent, landing the config at /kaniko-parent/.docker — exactly where kaniko
+                # then looks. crane (run afterwards to extract the schemas) does NOT relocate and
+                # reads DOCKER_CONFIG straight from our env, so point that at /kaniko/.docker too.
+                docker_config_dir = '/kaniko/.docker'
+                os.makedirs(docker_config_dir, exist_ok=True)
+
                 config_path = os.path.join(docker_config_dir, 'config.json')
                 with open(config_path, 'w') as f:
                     json.dump(config_content, f)
 
-                # Set DOCKER_CONFIG env var for kaniko and crane (crane also
-                # reads DOCKER_CONFIG for registry auth)
                 os.environ['DOCKER_CONFIG'] = docker_config_dir
 
             print(f"Running Kaniko to build and push image...")
@@ -210,10 +225,10 @@ class create_environment:
             except subprocess.TimeoutExpired:
                 raise RuntimeError("Kaniko build timed out after 10 minutes")
 
-            # Extract process_schemas.json from the built image using crane.
-            # This must run before tmpdir (and DOCKER_CONFIG, which points
-            # inside it) is removed on exit from this `with` block, otherwise
-            # crane loses its registry auth.
+            # Extract process_schemas.json from the built image using crane. crane reads
+            # registry auth from DOCKER_CONFIG (set above to /kaniko/.docker); that path lives
+            # outside tmpdir, so this no longer has to run before the `with` block exits, but
+            # keeping it here is harmless.
             print(f"Extracting process schemas from image...")
 
             tar_path = os.path.join(tmpdir, 'image.tar')
