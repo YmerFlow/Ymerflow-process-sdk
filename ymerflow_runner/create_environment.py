@@ -14,7 +14,6 @@ params.
 import json
 import os
 import re
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -22,6 +21,7 @@ import tempfile
 import fsspec
 
 from ymerflow_runner.params_to_dockerfile import params_to_dockerfile
+from ymerflow_runner.kaniko_build import kaniko_build
 
 
 def _default_params():
@@ -168,112 +168,47 @@ class create_environment:
         print(dockerfile_content)
         print("---")
 
-        # Create temporary directory for build context
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Write Dockerfile
-            dockerfile_path = os.path.join(tmpdir, 'Dockerfile')
-            with open(dockerfile_path, 'w') as f:
-                f.write(dockerfile_content)
-
-            # Kaniko reserves its working directory (default /kaniko) and excludes it from every
-            # build stage's filesystem. Environments built with install_kaniko contain
-            # `COPY --from=kaniko /kaniko/executor /kaniko-executor` — a source *under* /kaniko —
-            # which the reservation makes invisible, so the build dies with
-            # "lstat /kaniko/0/kaniko/executor: no such file or directory". (The identical
-            # Dockerfile builds fine under Docker/BuildKit, which is why the host base-runner build
-            # succeeds but this in-pod kaniko build does not.) Relocating kaniko's working dir to
-            # /kaniko-parent leaves /kaniko an ordinary path the COPY can read. Kaniko relocates by
-            # copying the existing /kaniko dir to KANIKO_DIR at startup, so /kaniko must exist first
-            # (the base-runner bakes only the standalone /kaniko-executor binary, no /kaniko dir).
-            os.makedirs('/kaniko', exist_ok=True)
-            os.environ['KANIKO_DIR'] = '/kaniko-parent'
-
-            # kaniko builds by unpacking the target image's rootfs onto THIS container's / (that is
-            # how it runs the RUN steps), so when it's done the container filesystem is the freshly
-            # built image, not the runner's — anything not on kaniko's ignore-list is gone. That
-            # includes our tmpdir AND the crane binary we need immediately afterwards to pull the
-            # schemas back out of the pushed image; without protection crane vanishes and its output
-            # dir vanishes, and the schema step dies with "crane: not found" / "no such file or
-            # directory". So stage the crane binary and a dedicated extraction workspace onto
-            # kaniko's --ignore-path — the very list that keeps /kaniko-executor alive across a build
-            # — so they survive into the post-build step. (tmpdir is only the build context; it is
-            # consumed before the wipe and needs no protection.)
-            crane_bin = shutil.which('crane') or '/usr/local/bin/crane'
-            extract_dir = tempfile.mkdtemp()  # survives kaniko via --ignore-path; removed at end
-
-            kaniko_args = [
-                '/kaniko-executor',
-                f'--context=dir://{tmpdir}',
-                f'--dockerfile={dockerfile_path}',
-                f'--destination={push_image_name}',  # bare host — see broken-by-design note above
+        # Build and push with kaniko, isolated in a chroot so it can't corrupt this runner pod's own
+        # filesystem/site-packages (ymerflow_runner.kaniko_build; see
+        # docs/plans/fix-kaniko-clobbers-runner-filesystem.md). Kaniko builds by unpacking the target
+        # image's rootfs onto its own container's / — the chroot contains that wipe entirely, so this
+        # process's crane binary and site-packages stay pristine and need no --ignore-path survival
+        # hacks. The /kaniko + KANIKO_DIR reservation dance lives inside the helper's chroot now.
+        # Push to the BARE host (push_image_name) and key auth to it — see the broken-by-design :443
+        # note above; the dev registry needs the insecure flags.
+        print(f"Running Kaniko to build and push image...")
+        kaniko_build(
+            dockerfile_content,
+            push_image_name,
+            registry_url=push_registry_url,
+            registry_auth=registry_auth or None,
+            extra_args=[
                 '--insecure',  # For dev registry without TLS
                 '--skip-tls-verify',  # For dev registry
                 '--insecure-pull',  # Allow pulling from insecure registries
                 f'--skip-tls-verify-registry={push_registry_url}',  # Skip TLS for pulling from our registry
-                f'--ignore-path={crane_bin}',    # keep crane alive through the rootfs wipe (see above)
-                f'--ignore-path={extract_dir}',  # keep the schema-extraction workspace alive too
-            ]
+            ],
+        )
+        print(f"✓ Image built and pushed successfully: {full_image_name}")
 
-            # Add auth if provided
+        # Extract process_schemas.json from the built image using crane, in this (now pristine)
+        # parent process. crane reads registry auth from DOCKER_CONFIG. Pull from the bare push host,
+        # not full_image_name: crane isn't go/kaniko-broken, but the :443 form would drag it through
+        # the same port-only "host change" on the blob GETs. No timeout: exporting a multi-GB image
+        # can take minutes and the Job's activeDeadlineSeconds already bounds it.
+        print(f"Extracting process schemas from image...")
+        with tempfile.TemporaryDirectory() as tmpdir:
             if registry_auth:
-                # Keyed by the bare push host: kaniko resolves the credential by the host it pushes
-                # to, so the auths key must match push_registry_url (see broken-by-design note above).
-                config_content = {
-                    "auths": {
-                        push_registry_url: {
-                            "auth": registry_auth
-                        }
-                    }
-                }
+                docker_config_dir = os.path.join(tmpdir, '.docker')
+                os.makedirs(docker_config_dir, exist_ok=True)
+                config_content = {"auths": {push_registry_url: {"auth": registry_auth}}}
+                with open(os.path.join(docker_config_dir, 'config.json'), 'w') as f:
+                    json.dump(config_content, f)
+                os.environ['DOCKER_CONFIG'] = docker_config_dir
 
-                # The same config in two places, because kaniko and crane read it from different
-                # locations AND kaniko wipes the filesystem between them:
-                #  - kaniko: setting KANIKO_DIR makes kaniko RESET DOCKER_CONFIG to
-                #    <KANIKO_DIR>/.docker at startup, ignoring whatever we export (kaniko issue
-                #    #3141), and it relocates by copying /kaniko -> /kaniko-parent and then DELETING
-                #    /kaniko. So the auth has to sit in /kaniko/.docker to ride that copy into
-                #    /kaniko-parent/.docker — exactly where kaniko then looks.
-                #  - crane (run afterwards to extract the schemas): by then kaniko has replaced the
-                #    rootfs, so anything under a non-ignored path is gone. Put crane's copy inside the
-                #    --ignore-path'd extract_dir so it survives, and point DOCKER_CONFIG there.
-                kaniko_config_dir = '/kaniko/.docker'
-                crane_config_dir = os.path.join(extract_dir, '.docker')
-                for d in (kaniko_config_dir, crane_config_dir):
-                    os.makedirs(d, exist_ok=True)
-                    with open(os.path.join(d, 'config.json'), 'w') as f:
-                        json.dump(config_content, f)
-
-                os.environ['DOCKER_CONFIG'] = crane_config_dir
-
-            print(f"Running Kaniko to build and push image...")
-
-            # No inner timeout: the only bound on a build is the process's own deadline, enforced at
-            # the Job level (activeDeadlineSeconds — see job_orchestrator.create_job_manifest). A
-            # hardcoded subprocess timeout here just second-guessed that deadline, capping every
-            # environment build at 10 minutes regardless of what the user requested — so a big env
-            # (compiling e.g. simpeg/pyinterp on a small CPU quota) failed even when the process
-            # timeout was generous. Likewise no capture_output: let kaniko stream straight to the
-            # pod's stdout so build progress is visible live in the log stream instead of being
-            # swallowed and only surfaced (or lost, on timeout) at the end.
-            result = subprocess.run(kaniko_args, cwd=tmpdir)
-
-            if result.returncode != 0:
-                raise RuntimeError(f"Kaniko build failed with exit code {result.returncode}")
-
-            print(f"✓ Image built and pushed successfully: {full_image_name}")
-
-            # Extract process_schemas.json from the built image using crane. Everything here lives
-            # in extract_dir / crane_bin, which we --ignore-path'd above so it outlived kaniko's
-            # rootfs wipe. crane reads registry auth from DOCKER_CONFIG (pointed at
-            # extract_dir/.docker above). Pull from the bare push host, not full_image_name: crane is
-            # not go/kaniko-broken, but it still starts from the host you hand it, and the :443 form
-            # would drag it through the same port-only "host change" on the blob GETs. No timeout:
-            # exporting a multi-GB image can take minutes, and the process deadline already bounds it.
-            print(f"Extracting process schemas from image...")
-
-            tar_path = os.path.join(extract_dir, 'image.tar')
+            tar_path = os.path.join(tmpdir, 'image.tar')
             crane_result = subprocess.run(
-                [crane_bin, 'export', '--insecure', push_image_name, tar_path],
+                ['crane', 'export', '--insecure', push_image_name, tar_path],
                 capture_output=True,
                 text=True,
             )
@@ -293,10 +228,6 @@ class create_environment:
                     )
                 with tar.extractfile(member) as f:
                     process_schemas = json.loads(f.read().decode('utf-8'))
-
-            # extract_dir is a bare mkdtemp (outside the `with tmpdir`), so clean it up ourselves —
-            # this also frees the multi-GB image.tar before the storage write below.
-            shutil.rmtree(extract_dir, ignore_errors=True)
 
             print(f"✓ Extracted process schemas: {list(process_schemas.keys())}")
 
