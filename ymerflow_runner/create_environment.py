@@ -146,10 +146,13 @@ class create_environment:
 
         print(f"Building image: {full_image_name}")
 
-        # If base_image doesn't have a registry prefix, add the local registry for ymerflow-* images
+        # If base_image doesn't have a registry prefix, add the registry for ymerflow-* images. Use
+        # the BARE host (push_registry_url), not the :443 form: kaniko pulls this over HTTPS and the
+        # auth config.json kaniko_build() stages is keyed to the bare host, so the :443 form would
+        # miss the auth lookup and pull anonymously → 401 (same port-only "host change" as the push).
         if base_image and not base_image.startswith(('registry:', 'localhost:', 'gcr.io/', 'docker.io/')):
             if base_image.startswith('ymerflow-'):
-                base_image_with_registry = f"{registry_url}/{base_image}"
+                base_image_with_registry = f"{push_registry_url}/{base_image}"
             else:
                 # External image from Docker Hub, use as-is
                 base_image_with_registry = base_image
@@ -175,7 +178,24 @@ class create_environment:
         # process's crane binary and site-packages stay pristine and need no --ignore-path survival
         # hacks. The /kaniko + KANIKO_DIR reservation dance lives inside the helper's chroot now.
         # Push to the BARE host (push_image_name) and key auth to it — see the broken-by-design :443
-        # note above; the dev registry needs the insecure flags.
+        # note above.
+        #
+        # Do NOT pass kaniko's `--insecure` / `--insecure-pull`. Those do not mean "tolerate a
+        # self-signed cert" — they force go-containerregistry to address the registry over plain
+        # *HTTP*. The push always goes through the external edge (registry.ymerflow.earth), which is
+        # HTTPS-only and 301-redirects every HTTP request to HTTPS. Under `--insecure`,
+        # go-containerregistry issues http://…, follows the 301 to https://…, then — because the
+        # registry is flagged insecure — coerces the redirect target back to http:// and reissues,
+        # so it ping-pongs http↔https until it trips its 10-redirect ceiling and aborts the manifest
+        # HEAD. That is the exact "stopped after 10 redirects" failure in
+        # docs/bugs/registry-manifest-push-redirect-loop.md (verified live: authenticated HTTPS
+        # manifest HEAD against the edge returns a clean 200/404 with zero redirects; only the
+        # HTTP-forced client loops). `--skip-tls-verify` is still required, though: the push always
+        # targets the official external registry address, and in dev that address presents a
+        # self-signed cert. Unlike `--insecure`, `--skip-tls-verify` only skips *certificate
+        # verification* over HTTPS — it never forces http, so it accepts the dev self-signed cert
+        # without triggering the loop. (crane below needs its own `--insecure` for the same
+        # self-signed cert; see why that one is safe there.)
         print(f"Running Kaniko to build and push image...")
         kaniko_build(
             dockerfile_content,
@@ -183,19 +203,28 @@ class create_environment:
             registry_url=push_registry_url,
             registry_auth=registry_auth or None,
             extra_args=[
-                '--insecure',  # For dev registry without TLS
-                '--skip-tls-verify',  # For dev registry
-                '--insecure-pull',  # Allow pulling from insecure registries
-                f'--skip-tls-verify-registry={push_registry_url}',  # Skip TLS for pulling from our registry
+                '--skip-tls-verify',  # HTTPS, skip only cert verification (never forces http)
+                f'--skip-tls-verify-registry={push_registry_url}',  # same, keyed to our registry
             ],
         )
         print(f"✓ Image built and pushed successfully: {full_image_name}")
 
         # Extract process_schemas.json from the built image using crane, in this (now pristine)
         # parent process. crane reads registry auth from DOCKER_CONFIG. Pull from the bare push host,
-        # not full_image_name: crane isn't go/kaniko-broken, but the :443 form would drag it through
-        # the same port-only "host change" on the blob GETs. No timeout: exporting a multi-GB image
-        # can take minutes and the Job's activeDeadlineSeconds already bounds it.
+        # not full_image_name: the :443 form would drag it through the same port-only "host change"
+        # on the blob GETs. No timeout: exporting a multi-GB image can take minutes and the Job's
+        # activeDeadlineSeconds already bounds it.
+        #
+        # `--insecure` IS correct here, unlike the kaniko push above. The push/pull target is always
+        # the official external registry address; in dev that address presents a self-signed cert, so
+        # crane must be allowed to skip certificate verification — and crane folds "skip cert verify"
+        # and "allow http" into the single `--insecure` flag with no http-only-free variant. Crucially
+        # this does NOT reintroduce the kaniko redirect loop: crane's go-containerregistry probes
+        # https FIRST, so against the HTTPS-only edge it connects over https and never exercises the
+        # http fallback that the edge's HTTP→HTTPS 301 would bounce. Verified live against the prod
+        # edge: `crane --insecure` returns a clean UNAUTHORIZED over https with zero redirects, where
+        # kaniko's `--insecure` (which coerces the request onto http) loops. So `--insecure` stays:
+        # necessary for the dev self-signed cert, harmless against the prod edge.
         print(f"Extracting process schemas from image...")
         with tempfile.TemporaryDirectory() as tmpdir:
             if registry_auth:
