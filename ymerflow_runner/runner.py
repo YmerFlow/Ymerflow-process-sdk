@@ -75,15 +75,41 @@ def main():
     refresher_process = None
     if credential_strategy == 'short-lived':
         from ymerflow_runner.storage_credentials_client import write_credentials_atomic, spawn_refresher
+        from ymerflow_runner.storage_credential_refresher import refresh_once
 
-        # Seed the credentials file with the fsspec kwargs the job was launched with, so the very
-        # first storage access (before the refresher has had a chance to run once) already has
-        # something to read instead of relying on env vars that fsspec/boto never picks up here.
-        write_credentials_atomic({
-            "kwargs": json.loads(os.environ.get('STORAGE_KWARGS_JSON') or '{}'),
-            "expires_at": os.environ.get('STORAGE_CREDENTIALS_EXPIRES_AT') or None,
-        })
-        refresher_process = spawn_refresher(os.environ.copy())
+        refresher_env = os.environ.copy()
+
+        # The credential in STORAGE_KWARGS_JSON was minted when the Job was *created*. Because the
+        # Job sits suspended in the Kueue queue until it's admitted, that can be arbitrarily long
+        # ago — long enough that the launch-time credential has already expired by the time this pod
+        # actually starts. So re-mint once, synchronously, at pod start: the first storage access
+        # then uses a credential whose lifetime begins now, independent of how long the job queued.
+        # Fall back to the launch-time credential only if the re-mint fails (e.g. backend briefly
+        # unreachable) — the background refresher spawned below keeps retrying either way.
+        try:
+            result = refresh_once(
+                os.environ['BACKEND_URL'],
+                os.environ['PROCESS_ID'],
+                os.environ['VERSION'],
+                os.environ['STORAGE_REFRESH_TOKEN'],
+            )
+            write_credentials_atomic({"kwargs": result["kwargs"], "expires_at": result.get("expires_at")})
+            # Tell the background loop about the fresh expiry so its first sleep is sized correctly
+            # instead of floored at MIN_SLEEP_SECONDS off the stale launch-time expiry.
+            if result.get("expires_at"):
+                refresher_env['STORAGE_CREDENTIALS_EXPIRES_AT'] = result["expires_at"]
+            print(f"Re-minted storage credential at pod start, expires_at={result.get('expires_at')}")
+        except Exception as e:
+            print(f"Startup storage-credential re-mint failed ({e}); falling back to launch-time "
+                  f"credential from STORAGE_KWARGS_JSON", file=sys.stderr)
+            # Seed the credentials file with the fsspec kwargs the job was launched with, so the very
+            # first storage access (before the refresher has had a chance to run once) already has
+            # something to read instead of relying on env vars that fsspec/boto never picks up here.
+            write_credentials_atomic({
+                "kwargs": json.loads(os.environ.get('STORAGE_KWARGS_JSON') or '{}'),
+                "expires_at": os.environ.get('STORAGE_CREDENTIALS_EXPIRES_AT') or None,
+            })
+        refresher_process = spawn_refresher(refresher_env)
         print(f"Started storage-credential refresher subprocess (pid {refresher_process.pid})")
 
     try:
