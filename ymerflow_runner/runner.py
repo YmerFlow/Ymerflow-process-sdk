@@ -3,6 +3,7 @@ import sys
 import json
 import subprocess
 import requests
+import fsspec
 from datetime import datetime
 
 try:
@@ -145,6 +146,21 @@ def main():
             print(f"Reporting outputs to backend: {result['outputs']}")
             # TODO: POST to backend to register outputs
             # requests.post(f"{backend_url}/process/{process_id}/outputs", json=result['outputs'])
+
+        # Durable completion marker. The pod's exit code (sys.exit(0) below → K8s job status) is
+        # the normal success signal, but the Job is TTL-reaped 1h after finishing, so a monitor
+        # that only arrives after that would otherwise have no way to tell "succeeded" from
+        # "failed". Write a version-level info.json whose mere PRESENCE means "this version
+        # completed successfully" — the backend consults it only on the TTL-404 recovery path
+        # (never on the normal exit-code path), so this is backwards-compatible with older
+        # runner images that don't write it. Written LAST, after run() has returned and all
+        # per-dataset outputs are in storage, so marker-present never races ahead of the outputs
+        # it attests to. Deliberately NOT written on the failure path below (absence = not
+        # successfully completed). See docs/plans/db-monitor-resilience-retry-and-sweep.md.
+        marker_url = f"{storage_base}/processes/{process_id}/{version}/info.json"
+        print(f"Writing completion marker: {marker_url}")
+        with fsspec.open(marker_url, 'w', **storage_context['storage_kwargs']) as f:
+            json.dump({"status": "done", "completed_at": datetime.utcnow().isoformat() + "Z"}, f)
 
         sys.exit(0)
 
